@@ -57,9 +57,19 @@ const char *type_name(uint32_t type) {
  * Return 0 if valid, -1 if invalid.
  */
 static int validate_superblock(const vsfs_superblock_t *sb) {
-    (void)sb;
-    fprintf(stderr, "TODO statimg.c: implement validate_superblock, walk_dir, and checks\n");
-    return -2;
+    if (sb->magic == VSFS_MAGIC &&
+        sb->total_blocks == VSFS_TOTAL_BLOCKS &&
+        sb->num_inodes == VSFS_NUM_INODES &&
+        sb->inode_bitmap_block == VSFS_INODE_BITMAP_BLK &&
+        sb->data_bitmap_block == VSFS_DATA_BITMAP_BLK &&
+        sb->inode_table_start == VSFS_INODE_TABLE_START &&
+        sb->inode_table_blocks == VSFS_INODE_TABLE_BLKS &&
+        sb->data_start == VSFS_DATA_START &&
+        sb->data_blocks == VSFS_DATA_BLOCKS)
+    {
+        return 0;
+    }
+    return -1;
 }
 
 /*
@@ -75,9 +85,23 @@ static int validate_superblock(const vsfs_superblock_t *sb) {
  * 4. Increment block_refs[blk].
  */
 void check_block_ptr(fs_ctx_t *ctx, uint32_t inum, uint32_t blk) {
-    (void)ctx;
-    (void)inum;
-    (void)blk;
+    if(blk < ctx->sb.data_start || blk >= ctx->sb.total_blocks) {
+        printf("ERROR invalid_block_ptr inode=%u block=%u\n", inum, blk);
+        ctx->errors++;
+        return;
+    }
+    if(get_bit(ctx->data_bm, blk) == 0) {
+        printf("ERROR unmarked_block inode=%u block=%u\n", inum, blk);
+        ctx->errors++;
+    }
+    if (ctx->block_refs[blk] > 0) {
+        printf("ERROR duplicate_block block=%u first_inode=%d second_inode=%u\n",
+               blk, ctx->block_owner[blk], inum);
+        ctx->errors++;
+    } else {
+        ctx->block_owner[blk] = (int32_t)inum;
+    }
+    ctx->block_refs[blk]++;
 }
 
 /*
@@ -87,9 +111,41 @@ void check_block_ptr(fs_ctx_t *ctx, uint32_t inum, uint32_t blk) {
  * nonzero uint32_t pointers stored inside the indirect block.
  */
 void print_inode_blocks(fs_ctx_t *ctx, uint32_t inum) {
-    (void)ctx;
-    (void)inum;
-    printf("blocks=[]");
+    const vsfs_inode_t *ino = &ctx->inodes[inum];
+    int first = 1;
+    printf("blocks=[");
+    for(uint32_t i = 0; i < VSFS_DIRECT_PTRS; i++) {
+        if (ino->direct[i] != 0) {
+            if (!first)
+                printf(",");
+            printf("%u", ino->direct[i]);
+            first = 0;
+        }
+    }
+
+    uint32_t pointers[VSFS_INDIRECT_PTRS];
+    if(ino->indirect != 0) {
+        if(!first)
+            printf(",");
+        printf("%u", ino->indirect);
+        first = 0;
+
+        if(read_block(ctx->fp, ino->indirect, pointers) == 0) {
+            for(uint32_t i = 0; i < VSFS_INDIRECT_PTRS; i++) {
+                if (pointers[i] != 0) {
+                    if (!first)
+                        printf(",");
+                    printf("%u", pointers[i]);
+                    first = 0;
+                }
+            }
+        }
+    }
+
+    printf("]");
+    if(ino->indirect != 0) {
+        printf(" indirect=%u", ino->indirect);
+    }
 }
 
 /*
@@ -115,9 +171,72 @@ void print_inode_blocks(fs_ctx_t *ctx, uint32_t inum) {
  *         recurse with walk_dir(ctx, target, full_path).
  */
 static void walk_dir(fs_ctx_t *ctx, uint32_t dir_inum, const char *dir_path) {
-    (void)ctx;
-    (void)dir_inum;
-    (void)dir_path;
+    ctx->visited_dir[dir_inum] = 1;
+
+    const vsfs_inode_t *dir = &ctx->inodes[dir_inum];
+
+    for (uint32_t d = 0; d < VSFS_DIRECT_PTRS; d++) {
+        uint32_t blk = dir->direct[d];
+        if (blk == 0) {
+            continue;
+        }
+
+        vsfs_dirent_t entries[VSFS_DIRENTS_PER_BLK];
+        if (read_block(ctx->fp, blk, entries) != 0) {
+            continue;
+        }
+
+        for (uint32_t e = 0; e < VSFS_DIRENTS_PER_BLK; e++) {
+            vsfs_dirent_t ent = entries[e];
+            if (ent.inode == VSFS_INVALID_INODE) {
+                continue;
+            }
+
+            char name[VSFS_NAME_MAX + 1];
+            memcpy(name, ent.name, VSFS_NAME_MAX);
+            name[VSFS_NAME_MAX] = '\0';
+
+            char full_path[4096];
+            if (strcmp(dir_path, "/") == 0) {
+                snprintf(full_path, sizeof(full_path), "/%s", name);
+            } else {
+                snprintf(full_path, sizeof(full_path), "%s/%s",
+                         dir_path, name);
+            }
+
+            uint32_t target = ent.inode;
+            if (target >= ctx->sb.num_inodes ||
+                ctx->inodes[target].type == VSFS_FREE) {
+                printf("ERROR dangling_dirent path=%s inode=%u\n",
+                       full_path, target);
+                ctx->errors++;
+                continue;
+            }
+
+            ctx->actual_refs[target]++;
+
+            if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
+                continue;
+            }
+
+            const vsfs_inode_t *ino = &ctx->inodes[target];
+            printf("ENTRY path=%s inode=%u type=%s size=%u links=%u ",
+                   full_path, target, type_name(ino->type),
+                   ino->size, ino->link_count);
+            print_inode_blocks(ctx, target);
+            printf("\n");
+
+            if (ino->type == VSFS_DIR) {
+                if (ctx->visited_dir[target] != 0) {
+                    printf("ERROR dir_cycle path=%s inode=%u\n",
+                           full_path, target);
+                    ctx->errors++;
+                } else {
+                    walk_dir(ctx, target, full_path);
+                }
+            }
+        }
+    }
 }
 
 /*
@@ -141,7 +260,59 @@ static void walk_dir(fs_ctx_t *ctx, uint32_t dir_inum, const char *dir_path) {
  *        print "ERROR leaked_block block=<b>\n", increment ctx->errors.
  */
 static void check_all_inodes_and_blocks(fs_ctx_t *ctx) {
-    (void)ctx;
+    for (uint32_t i = 0; i < ctx->sb.num_inodes; i++) {
+        uint32_t bm = get_bit(ctx->inode_bm, i);
+        uint32_t used = ctx->inodes[i].type != VSFS_FREE;
+
+        if (bm != used) {
+            printf("ERROR inode_bitmap_mismatch inode=%u bitmap=%u type=%s\n",
+                   i, bm, type_name(ctx->inodes[i].type));
+            ctx->errors++;
+        }
+
+        if (ctx->inodes[i].type == VSFS_FREE) {
+            continue;
+        }
+
+        for (uint32_t d = 0; d < VSFS_DIRECT_PTRS; d++) {
+            if (ctx->inodes[i].direct[d] != 0) {
+                check_block_ptr(ctx, i, ctx->inodes[i].direct[d]);
+            }
+        }
+
+        if (ctx->inodes[i].indirect != 0) {
+            uint32_t indirect = ctx->inodes[i].indirect;
+            check_block_ptr(ctx, i, indirect);
+
+            if (indirect >= ctx->sb.data_start &&
+                indirect < ctx->sb.total_blocks) {
+                uint32_t pointers[VSFS_INDIRECT_PTRS];
+                if (read_block(ctx->fp, indirect, pointers) == 0) {
+                    for (uint32_t p = 0; p < VSFS_INDIRECT_PTRS; p++) {
+                        if (pointers[p] != 0) {
+                            check_block_ptr(ctx, i, pointers[p]);
+                        }
+                    }
+                }
+            }
+        }
+
+        if (ctx->actual_refs[i] == 0) {
+            printf("ERROR orphan_inode inode=%u\n", i);
+            ctx->errors++;
+        } else if (ctx->inodes[i].link_count != ctx->actual_refs[i]) {
+            printf("ERROR link_count_mismatch inode=%u expected=%u actual=%u\n",
+                   i, ctx->inodes[i].link_count, ctx->actual_refs[i]);
+            ctx->errors++;
+        }
+    }
+
+    for (uint32_t b = ctx->sb.data_start; b < ctx->sb.total_blocks; b++) {
+        if (get_bit(ctx->data_bm, b) != 0 && ctx->block_refs[b] == 0) {
+            printf("ERROR leaked_block block=%u\n", b);
+            ctx->errors++;
+        }
+    }
 }
 
 int main(int argc, char **argv) {
